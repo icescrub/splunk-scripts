@@ -325,14 +325,17 @@ def extract_files(zip_filepath):
 
         for path in list_conf_files:
             split_path = path.split(os.sep)
-            tup = tuple(split_path[7:])
+            # History files have DIFFERENT filenames for each host. Need to cut the filename out of the mapping to allow for multiple files in the merging.
+            if 'history' in split_path:
+                tup = tuple(split_path[7:-1])
+            else:
+                tup = tuple(split_path[7:])
 
             # If user is in mapping, then map user to new environment.
             user = tup[1]
             if user in d_map_users:
                 new_user = d_map_users[user]
                 tup = (split_path[7],) + (new_user,) + tuple(split_path[9:])
-                print(tup)
 
             d_files[tup] = (path, origin)
 
