@@ -318,7 +318,7 @@ def extract_files(zip_filepath):
         # Create user map.
         csv_filepath = os.path.join(INITIAL_WORKING_DIRECTORY, "map_users.csv")
         with open(csv_filepath, 'r') as f:
-            reader = csv.reader(f, delimiter=' ')
+            reader = csv.reader(f, delimiter=',')
             for row in reader:
                 user_env1, user_env2 = row
                 d_map_users[user_env1] = user_env2
