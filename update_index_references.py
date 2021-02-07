@@ -78,21 +78,17 @@ import shutil
 import zipfile
 import csv
 import re
+import time
+import argparse
 from functools import wraps
 
 ##################
 # GLOBAL VARIABLES
 ##################
 
+global TARGET_DIRECTORY
 global INITIAL_WORKING_DIRECTORY
-# INITIAL_WORKING_DIRECTORY = os.getcwd()
-# INITIAL_WORKING_DIRECTORY = '/Applications/Splunk'
-
-global CURRENT_WORKING_DIRECTORY
-CURRENT_WORKING_DIRECTORY = os.getcwd()
-
 global DRY_RUN
-
 global INSTANCE
 
 global HOSTNAME
@@ -126,9 +122,8 @@ def log(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         # Set up logging.
-        cwd = os.getcwd()
         filename = "{}__update_index_references.log".format(HOSTNAME)
-        log_path = os.path.join(cwd, filename)
+        log_path = os.path.join(INITIAL_WORKING_DIRECTORY, filename)
         format = '%(asctime)s - %(levelname)s:  %(message)s'
         logging.basicConfig(filename=log_path,
                             filemode='a',
@@ -211,29 +206,30 @@ def update_references(d_map):
     # Depending on which instance you're running the script on, certain directories will be checked AND CHANGED.
 
     # check on all.
-    dir_system = os.path.join(INITIAL_WORKING_DIRECTORY, "etc/system")
+    dir_system = os.path.join(TARGET_DIRECTORY, "etc/system")
 
     # check on all. pretty sure this isn't centrally managed anywhere.
-    dir_disabled_apps = os.path.join(INITIAL_WORKING_DIRECTORY, "etc/disabled-apps")
+    dir_disabled_apps = os.path.join(TARGET_DIRECTORY, "etc/disabled-apps")
 
     # check on all but instances where splunk web is disabled (IDX, typically). However, no issue with checking null directory.
-    dir_users = os.path.join(INITIAL_WORKING_DIRECTORY, "etc/users")
+    dir_users = os.path.join(TARGET_DIRECTORY, "etc/users")
 
     # check on DS. Should be nowhere else.
-    dir_deployment_apps = os.path.join(INITIAL_WORKING_DIRECTORY, "etc/deployment-apps")
+    dir_deployment_apps = os.path.join(TARGET_DIRECTORY, "etc/deployment-apps")
 
     # check on CM (DS --> /master-apps on CM, NOT /apps); IDX (CM --> /slave-apps on IDX, NOT /apps).
     # do not check on SHs and HF and UF. these get apps from dep-apps.
     # DO check on DS.
-    dir_apps = os.path.join(INITIAL_WORKING_DIRECTORY, "etc/apps")
+    dir_apps = os.path.join(TARGET_DIRECTORY, "etc/apps")
 
     # master-apps. DO NOT check on CM, since CM gets apps from DS here.
-    # dir_master_apps = os.path.join(INITIAL_WORKING_DIRECTORY, "etc/master-apps")
+    # dir_master_apps = os.path.join(TARGET_DIRECTORY, "etc/master-apps")
 
 
-    dirs_all = [dir_system, dir_disabled_apps, dir_users]
-    dirs_DS = dirs_all + [dir_apps, dir_deployment_apps]
-    dirs_CM_IDX = dirs_all + [dir_apps]
+    dirs_all = [dir_system, dir_disabled_apps, dir_users, dir_apps]
+    dirs_DS = dirs_all + [dir_deployment_apps]
+    dirs_CM_IDX = dirs_all
+    dirs_SH = dirs_all
 
     dirs = list()
 
@@ -243,12 +239,14 @@ def update_references(d_map):
         dirs = dirs_CM_IDX
     elif INSTANCE == 'IDX':
         dirs = dirs_CM_IDX
+    elif INSTANCE == 'SH':
+        dirs = dirs_SH
     else:
         dirs = dirs_all
 
-    add_apps = raw_input("do you want to add etc/apps to the list? Do this only for instances not controlled by DS. (Y/N)")
-    if add_apps in ['Y', 'y', 'N', 'n']:
-       dirs.append(dir_apps)
+    # add_apps = raw_input("do you want to add etc/apps to the list? Do this only for instances not controlled by DS. (Y/N)")
+    # if add_apps in ['Y', 'y', 'N', 'n']:
+    #   dirs.append(dir_apps)
 
     logging.debug(log_format.format("Created list of directories appropriate for the {0} instance: {1}".format(INSTANCE, dirs)))
 
@@ -275,8 +273,8 @@ def update_references(d_map):
 
     # Third -e captures commands found in http_input, typically.
     grep_misc =            find_command \
-                        + " | xargs grep -irl -e 'indexes\s*=\s*[,\w]+{1}' "\
-                             "-e 'rollupIndex\s*=\s*.*{1}'"
+                        + " | xargs grep -irl -e 'indexes\s=\s.*{1}' "\
+                             "-e 'rollupIndex\s=\s.*{1}'"
 
 
 
@@ -325,19 +323,19 @@ def update_references(d_map):
 
             stream = os.popen(grep_inputs_searches.format(dir, old_index))
             cmd_output = stream.read().split('\n')
-            files_1 = list(filter(None, cmd_output))
+            files_1 = filternull(cmd_output)
 
             # Search 2. Check for transforms in this directory.
 
             stream = os.popen(grep_transforms.format(dir, old_index))
             cmd_output = stream.read().split('\n')
-            files_2 = list(filter(None, cmd_output))
+            files_2 = filternull(cmd_output)
 
             # Search 3. Check for miscellaneous possibilities.
 
             stream = os.popen(grep_misc.format(dir, old_index))
             cmd_output = stream.read().split('\n')
-            files_3 = list(filter(None, cmd_output))
+            files_3 = filternull(cmd_output)
 
             if files_1:
                 logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_1)))
@@ -361,7 +359,9 @@ def update_references(d_map):
                     with open(file, 'r') as f:
                         f_text = f.read()
 
-                    new_text = re.sub(old_index, new_index, f_text)
+                    pattern = "index\s*=\s*{0}".format(old_index)
+                    new_pattern = "index = {0}".format(new_index)
+                    new_text = re.sub(pattern, new_pattern, f_text)
 
                     if not DRY_RUN:
                         with open(file, 'w') as f:
@@ -378,8 +378,8 @@ def update_references(d_map):
 
                     # Uses IN operator.
                     if "index IN" in f_text:
-                        pattern = "(index\s*IN.*?){0}".format(old_index)
-                        index_prefix = re.findall(pattern, f_text)[0]
+                        search_pattern = "((index\s*IN.*?){0})".format(old_index)
+                        pattern, index_prefix = re.findall(pattern, f_text)[0]
                         new_pattern = index_prefix + new_index
                         new_text = re.sub(pattern, new_pattern, f_text)
 
@@ -400,15 +400,28 @@ def update_references(d_map):
                 with open(file, 'r') as f:
                     f_text = f.read()
 
-                new_text = re.sub(old_index, new_index, f_text)
-
+                pattern = "FORMAT\s*=\s*{0}".format(old_index)
+                new_pattern = "FORMAT = {0}".format(new_index)
+                new_text = re.sub(pattern, new_pattern, f_text)
+                
                 if not DRY_RUN:
                     with open(file, 'w') as f:
                         f.write(new_text)
 
             # MISC
             for file in files_3:
-                logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR {0}.".format(file)))
+
+                with open(file, 'r') as f:
+                    f_text = f.read()
+
+                pattern = "((indexes\s=\s.*?,?){0}(,?.*))(?:\s|\n)".format(old_index)
+                catch_all, catch_prefix, catch_suffix = re.findall(pattern, f_text)[0]
+                new_pattern = catch_prefix + new_index + catch_suffix
+                new_text = re.sub(catch_all, new_pattern, f_text)
+
+                if not DRY_RUN:
+                    with open(file, 'w') as f:
+                        f.write(new_text)
 
 
 
@@ -440,19 +453,19 @@ def update_references(d_map):
 
             stream = os.popen(grep_inputs_searches.format(dir, old_index))
             cmd_output = stream.read().split('\n')
-            files_1 = list(filter(None, cmd_output))
+            files_1 = filternull(cmd_output)
 
             # Search 2. Check for transforms in this directory.
 
             stream = os.popen(grep_transforms.format(dir, old_index))
             cmd_output = stream.read().split('\n')
-            files_2 = list(filter(None, cmd_output))
+            files_2 = filternull(cmd_output)
 
             # Search 3. Check for miscellaneous possibilities.
 
             stream = os.popen(grep_misc.format(dir, old_index))
             cmd_output = stream.read().split('\n')
-            files_3 = list(filter(None, cmd_output))
+            files_3 = filternull(cmd_output)
 
             if files_1:
                 logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_1)))
@@ -470,8 +483,6 @@ def update_references(d_map):
             for file in files_1:
                 # IGNORE INPUTS. Only history/macros/savedsearches are relevant.
 
-                check_dry(backup_file)(file)
-
                 if 'inputs' in file:
                     logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR INPUTS."))
                     pass
@@ -481,6 +492,9 @@ def update_references(d_map):
                      'views' in file or \
                      'panels' in file or \
                      'history' in file:
+
+                    check_dry(backup_file)(file)
+
                     with open(file, 'r') as f:
                         f_text = f.read()
 
@@ -534,10 +548,11 @@ def get_index_map(map_file):
     with open(map_file, 'r') as f:
         reader = csv.reader(f, delimiter=',')
         for row in reader:
-            # This unpacks the remaining new indexes in that row into a list.
-            # new_indexes is ALWAYS a list.
-            old_index, new_indexes = row[0], row[1:]
-            d_i[old_index] = new_indexes
+            if row:
+                # This unpacks the remaining new indexes in that row into a list.
+                # new_indexes is ALWAYS a list.
+                old_index, new_indexes = row[0], row[1:]
+                d_i[old_index] = new_indexes
 
     logging.debug(log_format.format("Mapping complete. Returning dictionary."))
 
@@ -556,7 +571,10 @@ def revert_changes():
 
     with open(backup_files, 'r') as f:
         files_text = f.read()
-        files = list(filter(None, files_text.split('\n')))
+        files_text_list = files_text.split('\n')
+        files = filternull(files_text_list)
+
+    issues_found = False
 
     for file in files:
 
@@ -567,7 +585,10 @@ def revert_changes():
 
         # Make reversion.
         backup_file = file + ".bak.script"
-        stream = os.popen("mv {0} {1}".format(backup_file, file))
+        shutil.move(backup_file, file)
+        # stream = os.popen("mv {0} {1}".format(backup_file, file))
+
+        time.sleep(1)
 
         # Check directory contents after change.
         cwd = os.path.dirname(file)
@@ -580,8 +601,24 @@ def revert_changes():
         # Check whether backup of file was successful.
         if ls1 == ls2:
             logging.debug(log_format.format("Something went wrong! No reversion."))
+            issues_found = True
         else:
             logging.debug(log_format.format("Reversion successful."))
+
+    if not issues_found:
+        logging.debug(log_format.format("Now removing file: {0}".format(backup_files)))
+        command = "rm {0}".format(backup_files)
+        stream = os.popen(command)
+    else:
+        find_command = "find {0} -type f -name '*bak.script'".format(TARGET_DIRECTORY)
+        stream = os.popen(find_command)
+        cmd_output = stream.read().split('\n')
+        bak_files = filternull(cmd_output)
+        logging.debug("Failed to revert changes. The following backup files were found: {0}".format(bak_files))
+
+
+def filternull(L):
+    return list(filter(None, L))
 
 
 @log
@@ -591,27 +628,33 @@ def backup_file(file):
     f_name = get_function_name()
     log_format = f_name + ": " + "{0}"
 
-    if not DRY_RUN:
+    # Confirms that DRY_RUN = False.
+    # Confirms that file has not already been backed up.
+    backup_file = file + ".bak.script"
+    if not DRY_RUN and not os.path.isfile(backup_file):
 
-        backup_file = os.path.join(INITIAL_WORKING_DIRECTORY, "backup_file_log.txt")
+        # Script assumes the parent of the splunk folder is the directory that the script lives in.
+        backup_record = os.path.join(INITIAL_WORKING_DIRECTORY, "backup_file_log.txt")
 
         # Record file in backup_file_log.txt file. This can be used for reversion.
-        with open(backup_file, 'a') as f:
+        with open(backup_record, 'a') as f:
             f.write('\n{}'.format(file))
 
         # Check directory contents before change.
         cwd = os.path.dirname(file)
-        stream = os.popen("ls {}".format(cwd))
-        ls1 = stream.read()
+        ls1 = os.listdir(cwd)
+        #stream = os.popen("ls {}".format(cwd))
+        #ls1 = stream.read()
 
-        # Make backup.
-        # Note that THIS is where the backup function doesn't get executed if DRY_RUN = True.
-        stream = check_dry(os.popen)("cp {}".format(file) + "{,.bak.script}")
+        # Make backup. Note that THIS is where the backup function doesn't get executed if DRY_RUN = True.
+        shutil.copy(file, backup_file)
+        # stream = check_dry(os.popen)("cp {}".format(file) + "{,.bak.script}")
                    
         # Check directory contents after change.
         cwd = os.path.dirname(file)
-        stream = os.popen("ls {}".format(cwd))
-        ls2 = stream.read()
+        ls2 = os.listdir(cwd)
+        # stream = os.popen("ls {}".format(cwd))
+        # ls2 = stream.read()
 
         # Check whether backup of file was successful.
         if ls1 == ls2:
@@ -619,15 +662,6 @@ def backup_file(file):
         else:
             logging.debug(log_format.format("Backup successful."))
     
-
-def check_list():
-    # Identify files on the instance that are backup files. This could complicate the backup function, so maybe rename them to bak1?
-    find_command = "find {0} -type f -name '*.bak'".format(INITIAL_WORKING_DIRECTORY)
-    stream = os.popen(find_command)
-    cmd_output = stream.read().split('\n')
-    bak_files = list(filter(None, cmd_output))
-    logging.debug("The following backup files were found: {0}".format(bak_files))
-
 
 ################
 # CLI INVOCATION
@@ -640,31 +674,45 @@ if __name__ == '__main__':
     --revert-changes
     """
 
-    global DRY_RUN
+    global TARGET_DIRECTORY
     global INSTANCE
+    global DRY_RUN
     global INITIAL_WORKING_DIRECTORY
 
-    DRY_RUN = True
+    INITIAL_WORKING_DIRECTORY = os.getcwd()
 
-    # Ensures we don't make changes to the production systems unless necessary.
-    value = raw_input("Please enter the target directory for the script. If you want to run the script in production, enter /opt/splunk.")
-    INITIAL_WORKING_DIRECTORY = value
+    # Create parser for script arguments.
+    parser = argparse.ArgumentParser()
 
-    map_indexes = sys.argv[1]
+    parser.add_argument('-t', '-target', action='store', dest='target', required=True, help='Directory to execute script on.')
+    parser.add_argument('-i', '-instance', action='store', dest='instance', choices=['DS', 'CM', 'IDX', 'SH', 'OTHER'], required=True, help='The instance the script is running on. Used to select the directories that will be searched.')
+    parser.add_argument('-m', '-map', action='store', required=True, dest='map', help='The full name of the CSV file that maps the old index to new indexes.')
 
-    if map_indexes != "index_map.csv":
-        logging.debug("Index map file not given. Please include the index_map.csv file.")
+    mutex_group = parser.add_mutually_exclusive_group(required=False)
+    mutex_group.add_argument('--disable-dry-run', action='store_false', dest='dry_run_state', help='Disables the safety feature that prevents the script from making production changes.')
+    mutex_group.add_argument('--revert-changes', action='store_true', help='Used to remove the backup files if the changes have been accepted.')
 
-    if '--instance' in sys.argv:
-        index = sys.argv.index('--instance')
-        INSTANCE = sys.argv[index + 1]
+    args = parser.parse_args()
 
-    if '--disable-dry-run' in sys.argv:
-        DRY_RUN = False
-        d_map = get_index_map(map_indexes)
-        update_references(d_map)
-    elif '--revert-changes' in sys.argv:
+    # Access arguments.
+    TARGET_DIRECTORY = args.target
+    INSTANCE = args.instance
+    DRY_RUN = args.dry_run_state
+
+    # Don't actually use this for clients.
+    # if not DRY_RUN:
+    #     splunk_home = os.environ['SPLUNK_HOME']
+    #    assert TARGET_DIRECTORY == splunk_home, "For production, the target directory should be $SPLUNK_HOME."
+
+    # if not ENABLE_PROD:
+    #     splunk_home = os.environ['SPLUNK_HOME']
+    #     assert TARGET_DIRECTORY != splunk_home, "Since this is not enabled for production, not allowed to run script on $SPLUNK_HOME."
+
+    if not args.map.endswith('csv'):
+        raise ValueError('The -map parameter should be a CSV file.')
+
+    if args.revert_changes:
         revert_changes()
     else:
-        d_map = get_index_map(map_indexes)
+        d_map = get_index_map(args.map)
         update_references(d_map)
