@@ -59,7 +59,6 @@ import re
 import argparse
 import functools
 import collections
-import string
 
 
 ##################
@@ -187,10 +186,8 @@ def get_function_name():
 def update_references():
 
     # Set up logging.
-    t = string.Template("$function: $message")
-    log_format = t.safe_substitute(function=f_name)
-    #f_name = get_function_name()
-    #log_format = f_name + ": " + "{0}"
+    f_name = get_function_name()
+    log_format = f_name + ": " + "{0}"
 
     # Get mapping from <old_index> to <new_indexes>.
     d_map = get_index_map(INDEX_MAP)
@@ -198,9 +195,9 @@ def update_references():
     # Get directories appropriate to the instance.
     instance_dirs = get_dirs(INSTANCE)
 
-    log_text = "Created list of directories appropriate for the {0} instance: {1}".format(INSTANCE, instance_dirs)
     # logging.debug(log_format.format(log_text))
-    logging.debug(log_format.substitute(message=log_text))
+    message = log_format.format("Created list of directories appropriate for the {0} instance: {1}".format(INSTANCE, instance_dirs))
+    logging.debug(message)
 
     for dir in instance_dirs:
         for root, _, files in os.walk(dir):
@@ -227,252 +224,189 @@ def update_references():
 
                         is_single_map = len(new_indexes) == 1
 
-                        # CASE 1: 1-1 map.
-                        if is_single_map:
+                        # CASE 1: SEARCHES
+                        if STAGE_1 and \
+                           (file.endswith(('macros.conf', 'savedsearches.conf')) or \
+                           file.endswith('.xml') and 'views' in root or \
+                           file.endswith('.xml') and 'panels' in root or \
+                           file.endswith('.csv') and 'history' in root):
 
-                            new_index = new_indexes[0]
+                            # Checks for case where IN operator is used.
+                            # Example: "index IN (main,os,netops,hadoop)"
+                            pattern_IN = r'index\s*IN.*?{0}\b'.format(old_index)
+                            if re.search(pattern_IN, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_IN, file))
+                                logging.info(message)
+                                check_dry(backup_file)(file)
+                                for match in re.finditer(pattern_IN, f_text, flags=re.IGNORECASE):
+                                    new_pattern = match.expand('\g<0>') + "," + ",".join(new_indexes)
+                                    f_text = re.sub(pattern_IN, new_pattern, f_text, flags=re.IGNORECASE)
 
-                            # CASE 1A: SEARCHES
-                            if STAGE_1 and \
-                               (file.endswith(('macros.conf', 'savedsearches.conf')) or \
-                               file.endswith('.xml') and 'views' in root or \
-                               file.endswith('.xml') and 'panels' in root or \
-                               file.endswith('.csv') and 'history' in root):
+                            # Second possibility of IN operator being used.
+                            # Example: "IN(index,main,os,netops,hadoop)"
+                            pattern_IN_2 = r'IN\(index,.*{0}\b'.format(old_index)
+                            if re.search(pattern_IN_2, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_IN_2, file))
+                                logging.info(message)
+                                check_dry(backup_file)(file)
+                                for match in re.finditer(pattern_IN_2, f_text, flags=re.IGNORECASE):
+                                    new_pattern = match.expand('\g<0>') + "," + ','.join(new_indexes)
+                                    f_text = re.sub(pattern_IN_2, new_pattern, f_text, flags=re.IGNORECASE)
 
-                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
 
-                                # Checks for case where IN operator is used.
-                                # Example: "index IN (main,os,netops,hadoop)"
-                                pattern_IN = r'index\s*IN.*?{0}\b'.format(old_index)
-                                if re.search(pattern_IN, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN, f_text)))
+                            # Checks for case where wildcard is used.
+                            # Manually reviewed.
+                            pattern_wildcard = r'index\s*=\s*"*{0}\*'.format(old_index)
+                            if re.search(pattern_wildcard, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found wildcard for pattern: {0} in file: {1}".format(pattern_wildcard, file))
+                                logging.warning(message)
+                                MANUAL_CHANGES_DICT[file].append((old_index, "Wildcard found."))
+
+                            # Checks for all permutations of "index = <index>", including those in dashboards.
+                            pattern_index = re.compile(r"""
+                                                        index
+                                                        (?:\s|%20)*=(?:\s|%20)*    # separates key from value
+                                                        (?:
+                                                              {index}\b
+                                                            | "{index}\b"
+                                                            | ""{index}\b""
+                                                            | %22{index}\b%22      # accounts for URL-encoded double quote
+                                                        )
+                                                        (?!\*)                     # ignore pattern if index has wildcard
+                                                        """.format(index=old_index), re.VERBOSE | re.IGNORECASE)
+                            if re.search(pattern_index, f_text):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_index, file))
+                                logging.info(message)
+                                check_dry(backup_file)(file)
+                                new_pattern =     "(" \
+                                                    + "index={0}".format(old_index) \
+                                                    + " OR index=" \
+                                                    + " OR index=".join(new_indexes) \
+                                                    + ")"
+                                f_text = re.sub(pattern_index, new_pattern, f_text)
+
+                            # Fixes up the URL-encoded section of dashboards and replaces spaces with %20.
+                            # This replacement is necessary for URL-encoded sections.
+                            pattern_target = r'target=.*?index={}.*?</link>'.format(old_index)
+                            if re.search(pattern_target, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_target, file))
+                                logging.info(message)
+                                check_dry(backup_file)(file)
+                                for match in re.finditer(pattern_target, f_text, flags=re.IGNORECASE):
+                                    # Replace spaces with %20, the HTML formatted value for a space.
+                                    new_pattern = match.expand('\g<0>').replace(' ', '%20')
+                                    f_text = re.sub(pattern_target, new_pattern, f_text, flags=re.IGNORECASE)
+
+
+                        # CASE 2: INDEXES
+                        if STAGE_1 and file.endswith('indexes.conf'):
+                            pass
+
+                        # CASE 3A: WMI
+                        if STAGE_1 and file.endswith('wmi.conf'):
+
+                            pattern_base = r'index\s*=\s*{0}\b'.format(old_index)
+                            if re.search(pattern_base, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_base, file))
+                                logging.warning(message)
+                                message = log_format.format("Perform manual review.")
+                                logging.warning(message)
+                                MANUAL_CHANGES_DICT[file].append((old_index, "Found in wmi.conf."))
+
+                        # CASE 3B: METRIC_ALERTS
+                        if STAGE_1 and file.endswith('metric_alerts.conf'):
+
+                            pattern_metrics = r'metric_indexes\s*=\s*.*?{0}\b'.format(old_index)
+                            if re.search(pattern_metrics, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_metrics, file))
+                                logging.warning(message)
+                                message = log_format.format("Perform manual review.")
+                                logging.warning(message)
+                                MANUAL_CHANGES_DICT[file].append((old_index, "Found in metric_alerts.conf."))
+
+                        # CASE 3C: METRIC_ROLLUPS
+                        if STAGE_1 and file.endswith('metric_rollups.conf'):
+
+                            pattern_rollups = r'rollupIndex\s*=\s*{0}\b'.format(old_index)
+                            if re.search(pattern_rollups, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_rollups, file))
+                                logging.warning(message)
+                                message = log_format.format("Perform manual review.")
+                                logging.warning(message)
+                                MANUAL_CHANGES_DICT[file].append((old_index, "Found in metric_rollups.conf."))
+
+
+                        # CASE 4: INPUTS
+                        if STAGE_2 and file.endswith('inputs.conf'):
+
+                            # Standard check.
+                            # Example: "index = main"
+                            pattern_base = r'index\s*=\s*{0}\b'.format(old_index)
+                            if re.search(pattern_base, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_base, file))
+                                logging.info(message)
+                                if is_single_map:
                                     check_dry(backup_file)(file)
-                                    for match in re.finditer(pattern_IN, f_text, flags=re.IGNORECASE):
-                                        new_pattern = match.expand('\g<0>') + "," + new_index
-                                        f_text = re.sub(pattern_IN, new_pattern, f_text, flags=re.IGNORECASE)
-
-                                # Second possibility of IN operator being used.
-                                # Example: "IN(index,main,os,netops,hadoop)"
-                                pattern_IN_2 = r'IN\(index,.*{0}\b'.format(old_index)
-                                if re.search(pattern_IN_2, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN_2, f_text)))
-                                    check_dry(backup_file)(file)
-                                    for match in re.finditer(pattern_IN_2, f_text, flags=re.IGNORECASE):
-                                        new_pattern = match.expand('\g<0>') + "," + new_index
-                                        f_text = re.sub(pattern_IN_2, new_pattern, f_text, flags=re.IGNORECASE)
-
-
-                                # Checks for case where wildcard is used.
-                                # Manually reviewed.
-                                pattern_wildcard = r'index\s*=\s*"*{0}\*'.format(old_index)
-                                if re.search(pattern_wildcard, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND WILDCARD. REVIEW MANUALLY."))
-                                    MANUAL_CHANGES_DICT[file].append((old_index, "Wildcard found."))
-
-                                # Checks for all permutations of "index = <index>", including those in dashboards.
-                                pattern_index = re.compile(r"""
-                                                            index
-                                                            (?:\s|%20)*=(?:\s|%20)*    # separates key from value
-                                                            (?:
-                                                                  {index}\b
-                                                                | "{index}\b"
-                                                                | ""{index}\b""
-                                                                | %22{index}\b%22      # accounts for URL-encoded double quote
-                                                            )
-                                                            (?!\*)                     # ignore pattern if index has wildcard
-                                                            """.format(index=old_index), re.VERBOSE)
-                                # pattern_index = r'index(?:\s|%20)*=(?:\s|%20)*(?:{index}\b|"{index}\b"|""{index}\b""|%22{index}\b%22)(?!\*)'.format(index=old_index)
-                                if re.search(pattern_index, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_index, f_text)))
-                                    check_dry(backup_file)(file)
-                                    new_pattern = "(index={0} OR index={1})".format(old_index, new_index)
-                                    f_text = re.sub(pattern_index, new_pattern, f_text, flags=re.IGNORECASE)
-
-                                # Fixes up the URL-encoded section of dashboards and replaces spaces with %20.
-                                # This replacement is necessary for URL-encoded sections.
-                                pattern_target = r'target=.*?index={}.*?</link>'.format(old_index)
-                                if re.search(pattern_target, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_target, f_text)))
-                                    check_dry(backup_file)(file)
-                                    for match in re.finditer(pattern_target, f_text, flags=re.IGNORECASE):
-                                        # Replace spaces with %20, the HTML formatted value for a space.
-                                        new_pattern = match.expand('\g<0>').replace(' ', '%20')
-                                        f_text = re.sub(pattern_target, new_pattern, f_text, flags=re.IGNORECASE)
-
-
-                            # CASE 1B: INDEXES
-                            if STAGE_1 and file.endswith('indexes.conf'):
-                                pass
-
-                            # CASE 1C: WMI/METRICS
-                            if STAGE_1 and (file.endswith('wmi.conf') or \
-                                 file.endswith('metric_alerts.conf') or \
-                                 file.endswith('metric_rollups.conf')):
-
-                                # This is where we CHECK that the search found something before we log it.
-
-                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
-                                logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR MISC."))
-                                MANUAL_CHANGES_DICT[file].append((old_index, "Miscellaneous file found."))
-
-                            # CASE 1D: INPUTS
-                            if STAGE_2 and file.endswith('inputs.conf'):
-
-                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
-
-                                # Standard check.
-                                # Example: "index = main"
-                                pattern_base = r'index\s*=\s*{0}\b'.format(old_index)
-                                if re.search(pattern_base, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_base, f_text)))
-                                    check_dry(backup_file)(file)
-                                    new_pattern = "index = {0}".format(new_index)
+                                    new_pattern = "index = {0}".format(new_indexes[0])
                                     f_text = re.sub(pattern_base, new_pattern, f_text, flags=re.IGNORECASE)
+                                else:
+                                    message = log_format.format("1-MANY map found for inputs.conf.")
+                                    logging.warning(message)
+                                    message = log_format.format("Perform manual review.")
+                                    logging.warning(message)
+                                    MANUAL_CHANGES_DICT[file].append((old_index, "1-MANY map for inputs.conf found."))
 
 
-                                # Checks for comma-separated indexes, as in http_inputs.
-                                # Example: "indexes = index1,index2,...,<old_index>,indexn,..."
-                                pattern_indexes = r'((?P<prefix>indexes\s*=\s*[\w,]*?){0})\b'.format(old_index)
-                                if re.search(pattern_indexes, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_indexes, f_text)))
+                            # Checks for comma-separated indexes, as in http_inputs.
+                            # Example: "indexes = index1,index2,...,<old_index>,indexn,..."
+                            pattern_indexes = r'((?P<prefix>indexes\s*=\s*[\w,]*?){0})\b'.format(old_index)
+                            if re.search(pattern_indexes, f_text, flags=re.IGNORECASE):
+                                message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_indexes, file))
+                                logging.info(message)
+                                if is_single_map:
                                     check_dry(backup_file)(file)
                                     for match in re.finditer(pattern_indexes, f_text, flags=re.IGNORECASE):
-                                        new_pattern = '\g<prefix>' + new_index
+                                        new_pattern = '\g<prefix>' + new_indexes[0]
                                         f_text = re.sub(match, new_pattern, f_text, flags=re.IGNORECASE)
+                                else:
+                                    message = log_format.format("1-MANY map found for inputs.conf.")
+                                    logging.warning(message)
+                                    message = log_format.format("Perform manual review.")
+                                    logging.warning(message)
+                                    MANUAL_CHANGES_DICT[file].append((old_index, "1-MANY map for inputs.conf found."))
 
 
-                            # CASE 1E: TRANSFORMS
-                            if STAGE_2 and file.endswith('transforms.conf'):
+                        # CASE 5: TRANSFORMS
+                        if STAGE_2 and file.endswith('transforms.conf'):
 
+                            if single_map:
                                 logging.info(log_format.format("FOUND FILE: {0}".format(file)))
 
                                 # Standard check for transforms.
                                 # Example: "FORMAT = new_index"
                                 pattern_format = r'FORMAT\s*=\s*{0}\b'.format(old_index)
                                 if re.search(pattern_format, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_format, f_text)))
-                                    check_dry(backup_file)(file)
-                                    new_pattern = "FORMAT = {0}".format(new_index)
-                                    f_text = re.sub(pattern_format, new_pattern, f_text, flags=re.IGNORECASE)
+                                    message = log_format.format("Found match for pattern: {0} in file: {1}".format(pattern_format, file))
+                                    logging.info(message)
+                                    if single_map:
+                                        check_dry(backup_file)(file)
+                                        new_pattern = "FORMAT = {0}".format(new_index)
+                                        f_text = re.sub(pattern_format, new_pattern, f_text, flags=re.IGNORECASE)
+                                    else:
+                                        message = log_format.format("1-MANY map found for transforms.conf.")
+                                        logging.warning(message)
+                                        message = log_format.format("Perform manual review.")
+                                        logging.warning(message)
+                                        MANUAL_CHANGES_DICT[file].append((old_index, "1-MANY map for transforms.conf found."))
 
 
-                        # CASE 2: 1-MANY map.
-                        else:
-
-                            # CASE 2A: SEARCHES
-                            if STAGE_1 and \
-                               (file.endswith(('macros.conf', 'savedsearches.conf')) or \
-                               file.endswith('.xml') and 'views' in root or \
-                               file.endswith('.xml') and 'panels' in root or \
-                               file.endswith('.csv') and 'history' in root):
-
-                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
-
-                                # Checks for case where IN operator is used.
-                                # Example: "index IN (main,os,netops,hadoop)"
-                                pattern_IN = r'index\s*IN.*?{0}\b'.format(old_index)
-                                if re.search(pattern_IN, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN, f_text)))
-                                    check_dry(backup_file)(file)
-                                    for match in re.finditer(pattern_IN, f_text, flags=re.IGNORECASE):
-                                        new_pattern = match.expand('\g<0>') + "," + ",".join(new_indexes)
-                                        f_text = re.sub(pattern_IN, new_pattern, f_text, flags=re.IGNORECASE)
-
-                                # Second possibility of IN operator being used.
-                                # Example: "IN(index,main,os,netops,hadoop)"
-                                pattern_IN_2 = r'IN\(index,.*{0}\b'.format(old_index)
-                                if re.search(pattern_IN_2, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN_2, f_text)))
-                                    check_dry(backup_file)(file)
-                                    for match in re.finditer(pattern_IN_2, f_text, flags=re.IGNORECASE):
-                                        new_pattern = match.expand('\g<0>') + "," + ','.join(new_indexes)
-                                        f_text = re.sub(pattern_IN_2, new_pattern, f_text, flags=re.IGNORECASE)
-
-                                # Checks for case where wildcard is used. This must be manually reviewed.
-                                pattern_wildcard = r'index\s*=\s*"*{0}\*'.format(old_index)
-                                if re.search(pattern_wildcard, f_text, re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND WILDCARD. REVIEW MANUALLY."))
-                                    MANUAL_CHANGES_DICT[file].append((old_index, "Wildcard found."))
-
-                                # Checks for all permutations of "index = <index>", including those in dashboards.
-                                pattern_index = re.compile(r"""
-                                                            index
-                                                            (?:\s|%20)*=(?:\s|%20)*    # separates key from value
-                                                            (?:
-                                                                  {index}\b
-                                                                | "{index}\b"
-                                                                | ""{index}\b""
-                                                                | %22{index}\b%22      # accounts for URL-encoded double quote
-                                                            )
-                                                            (?!\*)                     # ignore pattern if index has wildcard
-                                                            """.format(index=old_index), re.VERBOSE)
-                                # pattern_index = r'index(?:\s|%20)*=(?:\s|%20)*(?:{index}\b|"{index}\b"|""{index}\b""|%22{index}\b%22)(?!\*)'.format(index=old_index)
-                                if re.search(pattern_index, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_index, f_text)))
-                                    check_dry(backup_file)(file)
-                                    new_pattern = "(" \
-                                                 + "index={0}".format(old_index) \
-                                                 + " OR index=" \
-                                                 + " OR index=".join(new_indexes) \
-                                                 + ")"
-
-                                    f_text = re.sub(pattern_index, new_pattern, f_text, flags=re.IGNORECASE)
-
-                                # Fixes up the URL-encoded section of dashboards and replaces spaces with %20.
-                                # This replacement is necessary for URL-encoded sections.
-                                pattern_target = r'target=.*?index={}.*?</link>'.format(old_index)
-                                if re.search(pattern_target, f_text, flags=re.IGNORECASE):
-                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_target, f_text)))
-                                    check_dry(backup_file)(file)
-                                    for match in re.finditer(pattern_target, f_text, flags=re.IGNORECASE):
-                                        # Replace spaces with %20, the HTML formatted value for a space.
-                                        new_pattern = match.expand('\g<0>').replace(' ', '%20')
-                                        f_text = re.sub(pattern_target, new_pattern, f_text, flags=re.IGNORECASE)
-
-                            # CASE 2B: INDEXES
-                            if STAGE_1 and file.endswith('indexes.conf'):
-                                pass
-
-                            # CASE 2C: WMI/METRICS
-                            if STAGE_1 and (file.endswith('wmi.conf') or \
-                               file.endswith('metric_alerts.conf') or \
-                               file.endswith('metric_rollups.conf')):
-                                # This is where we CHECK that the search found something before we log it.
-                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
-                                logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR MISC."))
-                                MANUAL_CHANGES_DICT[file].append((old_index, "Miscellaneous file found."))
-                                pass
-
-                            # CASE 2D: INPUTS
-                            if STAGE_2 and file.endswith('inputs.conf'):
-
-                                pattern = r'index\s*=\s*{0}\b'.format(old_index)
-
-                                if re.search(pattern, f_text, flags=re.IGNORECASE):
-                                    logging.info(log_format.format("FOUND FILE: {0}".format(file)))
-                                    logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR INPUTS."))
-                                    MANUAL_CHANGES_DICT[file].append((old_index, "1-MANY input found."))
-                                    pass
-
-                            # CASE 2E: TRANSFORMS
-                            if STAGE_2 and file.endswith('transforms.conf'):
-
-                                pattern = r'FORMAT\s*=\s*{0}\b'.format(old_index)
-                                if re.search(pattern, f_text, flags=re.IGNORECASE):
-                                    logging.info(log_format.format("FOUND FILE: {0}".format(file)))
-                                    logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR TRANSFORMS."))
-                                    MANUAL_CHANGES_DICT[file].append((old_index, "1-MANY transform found."))
-                                    pass
-
-
-
-                    # After all changes to f_text are made, append to file.
+                    # After all changes to f_text are made, write to file.
                     if not DRY_RUN:
-                        with open(file, 'a') as f:
+                        with open(file, 'w') as f:
                             f.write(f_text)
 
 
-    # After all manual changed have been identified, record in txt file.
+    # After all manual changed have been identified, record in manual_changes_log.txt.
     if MANUAL_CHANGES_DICT:
         with open(MANUAL_CHANGES_LOG, 'a') as f:
             for file, data in MANUAL_CHANGES_DICT.items():
@@ -506,8 +440,8 @@ def get_index_map(map_file):
     Takes CSV file and converts it to a dictionary for use in main function.
     """
 
+    # Set up logging.
     f_name = get_function_name()
-    log_format = "{0}: {1}".format(f_name)
     log_format = f_name + ": " + "{0}"
 
     logging.debug(log_format.format("Mapping old index to new indexes."))
@@ -535,6 +469,12 @@ def get_dirs(instance):
     Each instance has a set of directories that should be checked.
     Some directories won't be checked if the DS already deploys to those directories.
     """
+
+    # Set up logging.
+    f_name = get_function_name()
+    log_format = f_name + ": " + "{0}"
+
+    logging.debug(log_format.format("Identifying appropriate directories for the instance."))
 
     # check on all.
     dir_system = os.path.join(TARGET_DIRECTORY, 'etc/system')
@@ -597,14 +537,15 @@ def backup_file(file):
     The bak.script file can be removed or re-instated with the revert_changes() or accept_changes() functions.
     """
 
+    # Set up logging.
     f_name = get_function_name()
-    log_format = get_function_name() + ": " + "{0}"
+    log_format = f_name + ": " + "{0}"
 
     # Confirms that DRY_RUN = False and confirms that the file has not already been backed up.
     backup_file = file + ".bak.script"
 
     if os.path.isfile(backup_file):
-        logging.debug(log_format.format("File already exists. Not backing up."))
+        logging.warning(log_format.format("File already exists. Not backing up."))
         return
 
     if not DRY_RUN:
@@ -616,8 +557,8 @@ def backup_file(file):
         # Make backup.
         try:
             shutil.copy(file, backup_file)
-        except FileNotFoundError:
-            logging.warning(log_format.format("Backup failed. File does not exist."))
+        except OSError:
+            logging.error(log_format.format("Backup failed. File does not exist."))
             return
         else:
             logging.debug(log_format.format("Backup successful."))
@@ -630,6 +571,7 @@ def revert_changes():
     Copies bak.script files over changed files. Reverts to original state.
     """
 
+    # Set up logging.
     f_name = get_function_name()
     log_format = f_name + ": " + "{0}"
 
@@ -640,8 +582,8 @@ def revert_changes():
             files_text = f.read()
             files_text_list = files_text.split('\n')
             files = list(filter(None, files_text_list))
-    except FileNotFoundError:
-        logging.debug(log_format.format("backup_file_log.txt does not exist."))
+    except OSError:
+        logging.error(log_format.format("backup_file_log.txt does not exist."))
         return
 
     issues_found = False
@@ -652,8 +594,8 @@ def revert_changes():
         try:
             backup_file = file + ".bak.script"
             shutil.move(backup_file, file)
-        except FileNotFoundError:
-            logging.debug(log_format.format("Reversion failed. Backup file not found."))
+        except OSError:
+            logging.error(log_format.format("Reversion failed. Backup file not found."))
             issues_found = True
         else:
             logging.debug(log_format.format("Reversion successful."))
@@ -672,7 +614,8 @@ def revert_changes():
         cmd_output = stream.read().split('\n')
         bak_files = list(filter(None, cmd_output))
 
-        logging.error("Failed to revert changes. The following backup files were found: {0}".format(bak_files))
+        message = "Failed to revert changes. The following backup files were found: {0}".format(bak_files)
+        logging.error(log_format.format(message))
 
 
 def accept_changes():
@@ -680,6 +623,7 @@ def accept_changes():
     Removes all bak.script files.
     """
 
+    # Set up logging.
     f_name = get_function_name()
     log_format = f_name + ": " + "{0}"
 
@@ -691,8 +635,8 @@ def accept_changes():
             files_text = f.read()
             files_text_list = files_text.split('\n')
             files = list(filter(None, files_text_list))
-    except FileNotFoundError:
-        logging.debug(log_format.format("backup_file_log.txt does not exist. Cancelling execution..."))
+    except OSError:
+        logging.error(log_format.format("backup_file_log.txt does not exist. Cancelling execution..."))
         return
 
     # Removes original file since changes have been accepted.
@@ -701,8 +645,8 @@ def accept_changes():
         try:
             backup_file = file + ".bak.script"
             os.remove(backup_file)
-        except FileNotFoundError:
-            logging.debug(log_format.format("File deletion failed for {0}.".format(file)))
+        except OSError:
+            logging.error(log_format.format("File deletion failed for {0}.".format(file)))
             issues_found = True
         else:
             logging.debug(log_format.format("File deletion successful."))
@@ -712,7 +656,7 @@ def accept_changes():
         logging.debug(log_format.format("Now removing backup file: {0}".format(BACKUP_FILE_LOG)))
         os.remove(BACKUP_FILE_LOG)
     else:
-        logging.error("Failed to delete all backup files. Review logs.")
+        logging.error(log_format.format("Failed to delete all backup files. Review logs."))
 
 
 ################
