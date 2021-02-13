@@ -1,39 +1,38 @@
 #!/usr/bin/python
 
 """
-Requires index_map.csv file that maps each index to a new index or set of indexes.
-1-1 mapping is easy.
-1-many mapping is not easy for inputs/transforms but CAN be easy for macros and saved searches.
-As Matt noted, if data source is going to MULTIPLE new indexes now then that's another issue.
-Requires TCP routing and such.
+Usage:
 
-We check the following places:
+Stage 1 RUN:     <script> -target T -instance I -map M --stage-1 --disable-dry-run
+Stage 1 CONFIRM: <script> -target T -instance I -map M --stage-1 --accept-changes
+Stage 2 RUN:     <script> -target T -instance I -map M --stage-2 --disable-dry-run
+Stage 2 CONFIRM: <script> -target T -instance I -map M --stage-2 --accept-changes
+Stage 3: manual review.
 
-etc/system (ALL - NOTE that this cannot be checked on the DS);
-etc/apps (DS);
-etc/deployment-apps (DS);
-etc/master-apps (CM - although it should be getting its configurations from DS);
-etc/master-apps/_cluster (CM - this may have unique configurations here);
-etc/users (SH - should have macros.conf and savedsearches.conf settings - ALSO be wary of local.meta because someone may have created index in a LOCAL space);
-etc/disabled-apps (maybe? just in case?)
-NOTE: nothing in shcluster in this case because of environment. Probably tough to do this if on SH cluster...
-NOTE: this script should be run on every system possible. Ignore apps for non-DS and users for forwarders (does it even have users dir?)
+============================================================
 
-INCLUSIONS (check all of these in dry run)
+Description:
 
-inputs.conf (data collection tier);
-transforms.conf (indexing tier);
-savedsearches.conf;
+1-1 mapping is simple.
+1-many mappings require manual review for inputs/transforms.
+
+Files that are reviewed for 1-1 mapping.
+
+inputs.conf
+    - http_input app has 'indexes' key.
+    - alert_logevent app has 'param.index = main' key.
+transforms.conf
+savedsearches.conf
 macros.conf
-    this contains user-created macros AND those created by CIM for mapping indexes to DMs
-NOTE: http_input app has 'indexes' key.
-    THIS is actually a weird one. It could be hidden inside of this kv pair. "indexes = main,notable,firewall"
-    There's a reference to it in this line but it's not actually captured. needs new capture for it.
-NOTE: alert_logevent app has 'param.index = main'.
-local.meta - needs to be changed here IF it exists. This occurs if index is created IN an app. Check in dry run.
-history file? debatable if this is desirable...
+history (CSV files)
+dashboards (XML files)
 
-WEIRD INCLUSIONS
+Files that are not reviewed for 1-MANY mapping.
+
+inputs.conf
+transforms.conf
+
+Files that are not reviewed at all.
 
 indexes.conf
     vix.output.buckets.from.indexes = <comma separated list of splunk indexes>
@@ -43,27 +42,8 @@ metric_rollups.conf
     rollup.<summary number>.rollupIndex = <string Index name>
 wmi.conf
     index = <string>
-
-EXCLUSIONS:
-
-indexes.conf (anything here must not be touched by this script - ensure with dry_run logic);
-index=main and index=lastchance (this shouldn't be in the index_map.csv file anyways but ensure);
-bootstrapsearches.txt
-searchbnf.conf
-json files. I've seen this before.
-
-DRY RUN:
-
-check if anything in default. Shouldn't be anything changeable here. That's a config that the app expects.
-in loop, print out whether index mapping is 1-1 or not and SAY that it needs manual review.
-
-INPUTS.CONF
-index\s*=\s*<old_index>
-
-TRANSFORMS.CONF
-
-FORMAT\s*=\s*<old_index>
 """
+
 
 ########
 # IMPORTS
@@ -73,23 +53,38 @@ import sys
 import os
 import logging
 import socket
-import tempfile
 import shutil
-import zipfile
 import csv
 import re
-import time
 import argparse
-from functools import wraps
+import functools
+import collections
+import string
+
 
 ##################
 # GLOBAL VARIABLES
 ##################
 
 global TARGET_DIRECTORY
-global INITIAL_WORKING_DIRECTORY
+global INDEX_MAP
 global DRY_RUN
 global INSTANCE
+global STAGE_1
+global STAGE_2
+global MANAGED_DIRECTORY
+
+global INITIAL_WORKING_DIRECTORY
+INITIAL_WORKING_DIRECTORY = os.getcwd()
+
+global BACKUP_FILE_LOG
+BACKUP_FILE_LOG = os.path.join(INITIAL_WORKING_DIRECTORY, "backup_file_log.txt")
+
+global MANUAL_CHANGES_LOG
+MANUAL_CHANGES_LOG = os.path.join(INITIAL_WORKING_DIRECTORY, "manual_changes_log.txt")
+
+global MANUAL_CHANGES_DICT
+MANUAL_CHANGES_DICT = collections.defaultdict(list)
 
 global HOSTNAME
 HOSTNAME = socket.gethostname()
@@ -101,13 +96,14 @@ HOSTNAME = socket.gethostname()
 
 def check_dry(func):
     """
-    Wrapper function for functions that would write to a file. Not strictly a decorator.
+    Wrapper function for functions that would perform write-level actions.
+    Not used for context managers.
     """
 
-    @wraps(func)
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if DRY_RUN:
-            logging.debug("DRY RUN executed for function %s with the following arguments: %s" % (func.__name__, args))
+            logging.debug("DRY RUN executed for function {0} with the following arguments: {1}".format(func.__name__, args))
         else:
             logging.debug("DRY_RUN = False. Making write-level changes with args {0}.".format(*args))
             func(*args, **kwargs)
@@ -116,15 +112,15 @@ def check_dry(func):
 
 def log(func):
     """
-    Sets up logging for function.
+    Sets up logging functionality.
     """
 
-    @wraps(func)
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
         # Set up logging.
-        filename = "{}__update_index_references.log".format(HOSTNAME)
+        filename = "{0}__update_index_references.log".format(HOSTNAME)
         log_path = os.path.join(INITIAL_WORKING_DIRECTORY, filename)
-        format = '%(asctime)s - %(levelname)s:  %(message)s'
+        format = "%(asctime)s - %(levelname)s:  %(message)s"
         logging.basicConfig(filename=log_path,
                             filemode='a',
                             format=format,
@@ -134,11 +130,13 @@ def log(func):
         return value
     return wrapper
 
+
 def debug(func):
     """
-    Print the function signature and return value.
+    Print the function signature (name and arguments).
     """
-    @wraps(func)
+
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
         args_repr = [repr(a) for a in args]
 
@@ -151,9 +149,9 @@ def debug(func):
         args_signature = "\n".join(args_repr)
         kwargs_signature = "\n".join(kwargs_repr)
 
-        debug_string = "Calling function {} with the following arguments:\n" \
-                       + "=== ARGS ===\n{}\n=============="*bool(args_signature) \
-                       + "=== KWARGS ===\n{}\n=============="*bool(kwargs_signature)
+        debug_string = "Calling function {0} with the following arguments:\n" \
+                       + "=== ARGS ===\n{1}\n=============="*bool(args_signature) \
+                       + "=== KWARGS ===\n{2}\n=============="*bool(kwargs_signature)
 
         if args_signature and kwargs_signature:
             debug_string = debug_string.format(func.__name__, args_signature, kwargs_signature)
@@ -171,6 +169,7 @@ def debug(func):
         return value
     return wrapper
 
+
 def get_function_name():
     """
     Get name of function this is called from.
@@ -179,540 +178,611 @@ def get_function_name():
     return sys._getframe(1).f_code.co_name
 
 
-################
-# MAIN FUNCTIONS
-################
+###############
+# MAIN FUNCTION
+###############
 
 @log
 @debug
-def update_references(d_map):
-    # Now we have a mapping from old_index to a set of new_indexes.
-
-
-
-
-    ### Set up for logging.
-
-    f_name = get_function_name()
-    log_format = f_name + ": " + "{0}"
-
-
-
-
-
-    ### Set up for directories to look for.
-    # ASSUMES YOU ARE IN $SPLUNK_HOME.
-    # Creates the directories under consideration.
-    # Depending on which instance you're running the script on, certain directories will be checked AND CHANGED.
-
-    # check on all.
-    dir_system = os.path.join(TARGET_DIRECTORY, "etc/system")
-
-    # check on all. pretty sure this isn't centrally managed anywhere.
-    dir_disabled_apps = os.path.join(TARGET_DIRECTORY, "etc/disabled-apps")
-
-    # check on all but instances where splunk web is disabled (IDX, typically). However, no issue with checking null directory.
-    dir_users = os.path.join(TARGET_DIRECTORY, "etc/users")
-
-    # check on DS. Should be nowhere else.
-    dir_deployment_apps = os.path.join(TARGET_DIRECTORY, "etc/deployment-apps")
-
-    # check on CM (DS --> /master-apps on CM, NOT /apps); IDX (CM --> /slave-apps on IDX, NOT /apps).
-    # do not check on SHs and HF and UF. these get apps from dep-apps.
-    # DO check on DS.
-    dir_apps = os.path.join(TARGET_DIRECTORY, "etc/apps")
-
-    # master-apps. DO NOT check on CM, since CM gets apps from DS here.
-    # dir_master_apps = os.path.join(TARGET_DIRECTORY, "etc/master-apps")
-
-
-    dirs_all = [dir_system, dir_disabled_apps, dir_users, dir_apps]
-    dirs_DS = dirs_all + [dir_deployment_apps]
-    dirs_CM_IDX = dirs_all
-    dirs_SH = dirs_all
-
-    dirs = list()
-
-    if INSTANCE == 'DS':
-        dirs = dirs_DS
-    elif INSTANCE == 'CM':
-        dirs = dirs_CM_IDX
-    elif INSTANCE == 'IDX':
-        dirs = dirs_CM_IDX
-    elif INSTANCE == 'SH':
-        dirs = dirs_SH
-    else:
-        dirs = dirs_all
-
-    # add_apps = raw_input("do you want to add etc/apps to the list? Do this only for instances not controlled by DS. (Y/N)")
-    # if add_apps in ['Y', 'y', 'N', 'n']:
-    #   dirs.append(dir_apps)
-
-    logging.debug(log_format.format("Created list of directories appropriate for the {0} instance: {1}".format(INSTANCE, dirs)))
-
-
-    ### Set up commands to run on each instance on the directories outlined above.
-
-    find_command = "find {0} -type f -name '*.conf' -o -name '*.xml' -o -name '*.csv'"\
-                 "| grep -v 'example$'"\
-                 "| grep -v 'spec$'"\
-                 "| grep -v 'txt$'"\
-                 "| grep -v 'json$'"\
-                 "| grep -v 'py$'"\
-                 "| grep -v 'pyc$'"\
-                 "| grep -v 'lookups'"\
-                 "| grep -v 'default'"
-
-    # First -e captures commands found in inputs.conf, macros.conf, etc.
-    grep_inputs_searches = find_command \
-                        + " | xargs grep -irl -e 'index\s*=\s*{1}'"
-
-    # Second -e captures commands found in transforms.conf.
-    grep_transforms =      find_command \
-                        + " | xargs grep -irl -e 'FORMAT\s*=\s*{1}'"
-
-    # Third -e captures commands found in http_input, typically.
-    grep_misc =            find_command \
-                        + " | xargs grep -irl -e 'indexes\s=\s.*{1}' "\
-                             "-e 'rollupIndex\s=\s.*{1}'"
-
-
-
-
-
-
-
-
-    # Splits d_map into 1-1 mappings and NOT 1-1 mappings.
-
-    d_map_11 = dict()
-    d_map_not_11 = dict()
-
-    for k,v in d_map.items():
-        if len(v) == 1:
-            d_map_11[k] = v
-        else:
-            d_map_not_11[k] = v
-
-    logging.debug(log_format.format("The following indexes are 1-1: %s" % str(list(d_map_11.keys()))))
-    logging.debug(log_format.format("The following indexes are NOT 1-1: %s" % str(list(d_map_not_11.keys()))))
-
-
-
-    # CASE 1. 1-1 map. Both subcases (inputs/transforms and also KO objects) are easy to change.
-
-    for old_index in d_map_11:
-
-        new_index = d_map_11[old_index][0]
-
-        logging.debug(log_format.format("CASE 1 for {0} index: Now identifying files that can be immediately changed with the 1-1 map.".format(old_index)))
-
-
-
-
-        #################################################
-
-        # This should be its own function.
-
-        # At this point, we've selected the dirs that are appropriate for the instance. We're safe here.
-        for dir in dirs:
-
-            logging.debug(log_format.format("Checking {} directory.".format(dir)))
-
-            # Search 1. Check for inputs, macros, dashboards, and history in this directory.
-
-            stream = os.popen(grep_inputs_searches.format(dir, old_index))
-            cmd_output = stream.read().split('\n')
-            files_1 = filternull(cmd_output)
-
-            # Search 2. Check for transforms in this directory.
-
-            stream = os.popen(grep_transforms.format(dir, old_index))
-            cmd_output = stream.read().split('\n')
-            files_2 = filternull(cmd_output)
-
-            # Search 3. Check for miscellaneous possibilities.
-
-            stream = os.popen(grep_misc.format(dir, old_index))
-            cmd_output = stream.read().split('\n')
-            files_3 = filternull(cmd_output)
-
-            if files_1:
-                logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_1)))
-            if files_2:
-                logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_2)))
-            if files_3:
-                logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_3)))
-            if not any((files_1, files_2, files_3)):
-                logging.debug(log_format.format("No files identified."))
-
-
-            # Now we have a list of files containing references to the old index.
-            # We can loop over them separately because they have different rules depending on inputs, transforms, etc.
-
-            # INPUTS AND SEARCHES
-            for file in files_1:
-
-                check_dry(backup_file)(file)
-
-                if 'inputs' in file:
+def update_references():
+
+    # Set up logging.
+    t = string.Template("$function: $message")
+    log_format = t.safe_substitute(function=f_name)
+    #f_name = get_function_name()
+    #log_format = f_name + ": " + "{0}"
+
+    # Get mapping from <old_index> to <new_indexes>.
+    d_map = get_index_map(INDEX_MAP)
+
+    # Get directories appropriate to the instance.
+    instance_dirs = get_dirs(INSTANCE)
+
+    log_text = "Created list of directories appropriate for the {0} instance: {1}".format(INSTANCE, instance_dirs)
+    # logging.debug(log_format.format(log_text))
+    logging.debug(log_format.substitute(message=log_text))
+
+    for dir in instance_dirs:
+        for root, _, files in os.walk(dir):
+            # Exclude lookups and anything in a default directory.
+            if not ('lookups' in root or 'default' in root):
+                for file in files:
+
+                    # Exclude files without the right extension.
+                    # This provides the filtering necessary to quickly get the text of the files we care about.
+                    if not (file.endswith(('inputs.conf', 'transforms.conf', 'macros.conf', 'savedsearches.conf', \
+                                            'indexes.conf', 'wmi.conf', 'metric_alerts.conf', 'metric_rollups.conf')) \
+                            or (file.endswith('xml') and 'views' in root) \
+                            or (file.endswith('xml') and 'panels' in root) \
+                            or (file.endswith('.csv') and 'history' in root)):
+                        continue
+
+                    file = os.path.join(root, file)
+
+                    # Reads file for processing.
                     with open(file, 'r') as f:
                         f_text = f.read()
 
-                    pattern = "index\s*=\s*{0}".format(old_index)
-                    new_pattern = "index = {0}".format(new_index)
-                    new_text = re.sub(pattern, new_pattern, f_text)
+                    for old_index, new_indexes in d_map.items():
 
+                        is_single_map = len(new_indexes) == 1
+
+                        # CASE 1: 1-1 map.
+                        if is_single_map:
+
+                            new_index = new_indexes[0]
+
+                            # CASE 1A: SEARCHES
+                            if STAGE_1 and \
+                               (file.endswith(('macros.conf', 'savedsearches.conf')) or \
+                               file.endswith('.xml') and 'views' in root or \
+                               file.endswith('.xml') and 'panels' in root or \
+                               file.endswith('.csv') and 'history' in root):
+
+                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+
+                                # Checks for case where IN operator is used.
+                                # Example: "index IN (main,os,netops,hadoop)"
+                                pattern_IN = r'index\s*IN.*?{0}\b'.format(old_index)
+                                if re.search(pattern_IN, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN, f_text)))
+                                    check_dry(backup_file)(file)
+                                    for match in re.finditer(pattern_IN, f_text, flags=re.IGNORECASE):
+                                        new_pattern = match.expand('\g<0>') + "," + new_index
+                                        f_text = re.sub(pattern_IN, new_pattern, f_text, flags=re.IGNORECASE)
+
+                                # Second possibility of IN operator being used.
+                                # Example: "IN(index,main,os,netops,hadoop)"
+                                pattern_IN_2 = r'IN\(index,.*{0}\b'.format(old_index)
+                                if re.search(pattern_IN_2, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN_2, f_text)))
+                                    check_dry(backup_file)(file)
+                                    for match in re.finditer(pattern_IN_2, f_text, flags=re.IGNORECASE):
+                                        new_pattern = match.expand('\g<0>') + "," + new_index
+                                        f_text = re.sub(pattern_IN_2, new_pattern, f_text, flags=re.IGNORECASE)
+
+
+                                # Checks for case where wildcard is used.
+                                # Manually reviewed.
+                                pattern_wildcard = r'index\s*=\s*"*{0}\*'.format(old_index)
+                                if re.search(pattern_wildcard, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND WILDCARD. REVIEW MANUALLY."))
+                                    MANUAL_CHANGES_DICT[file].append((old_index, "Wildcard found."))
+
+                                # Checks for all permutations of "index = <index>", including those in dashboards.
+                                pattern_index = re.compile(r"""
+                                                            index
+                                                            (?:\s|%20)*=(?:\s|%20)*    # separates key from value
+                                                            (?:
+                                                                  {index}\b
+                                                                | "{index}\b"
+                                                                | ""{index}\b""
+                                                                | %22{index}\b%22      # accounts for URL-encoded double quote
+                                                            )
+                                                            (?!\*)                     # ignore pattern if index has wildcard
+                                                            """.format(index=old_index), re.VERBOSE)
+                                # pattern_index = r'index(?:\s|%20)*=(?:\s|%20)*(?:{index}\b|"{index}\b"|""{index}\b""|%22{index}\b%22)(?!\*)'.format(index=old_index)
+                                if re.search(pattern_index, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_index, f_text)))
+                                    check_dry(backup_file)(file)
+                                    new_pattern = "(index={0} OR index={1})".format(old_index, new_index)
+                                    f_text = re.sub(pattern_index, new_pattern, f_text, flags=re.IGNORECASE)
+
+                                # Fixes up the URL-encoded section of dashboards and replaces spaces with %20.
+                                # This replacement is necessary for URL-encoded sections.
+                                pattern_target = r'target=.*?index={}.*?</link>'.format(old_index)
+                                if re.search(pattern_target, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_target, f_text)))
+                                    check_dry(backup_file)(file)
+                                    for match in re.finditer(pattern_target, f_text, flags=re.IGNORECASE):
+                                        # Replace spaces with %20, the HTML formatted value for a space.
+                                        new_pattern = match.expand('\g<0>').replace(' ', '%20')
+                                        f_text = re.sub(pattern_target, new_pattern, f_text, flags=re.IGNORECASE)
+
+
+                            # CASE 1B: INDEXES
+                            if STAGE_1 and file.endswith('indexes.conf'):
+                                pass
+
+                            # CASE 1C: WMI/METRICS
+                            if STAGE_1 and (file.endswith('wmi.conf') or \
+                                 file.endswith('metric_alerts.conf') or \
+                                 file.endswith('metric_rollups.conf')):
+
+                                # This is where we CHECK that the search found something before we log it.
+
+                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+                                logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR MISC."))
+                                MANUAL_CHANGES_DICT[file].append((old_index, "Miscellaneous file found."))
+
+                            # CASE 1D: INPUTS
+                            if STAGE_2 and file.endswith('inputs.conf'):
+
+                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+
+                                # Standard check.
+                                # Example: "index = main"
+                                pattern_base = r'index\s*=\s*{0}\b'.format(old_index)
+                                if re.search(pattern_base, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_base, f_text)))
+                                    check_dry(backup_file)(file)
+                                    new_pattern = "index = {0}".format(new_index)
+                                    f_text = re.sub(pattern_base, new_pattern, f_text, flags=re.IGNORECASE)
+
+
+                                # Checks for comma-separated indexes, as in http_inputs.
+                                # Example: "indexes = index1,index2,...,<old_index>,indexn,..."
+                                pattern_indexes = r'((?P<prefix>indexes\s*=\s*[\w,]*?){0})\b'.format(old_index)
+                                if re.search(pattern_indexes, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_indexes, f_text)))
+                                    check_dry(backup_file)(file)
+                                    for match in re.finditer(pattern_indexes, f_text, flags=re.IGNORECASE):
+                                        new_pattern = '\g<prefix>' + new_index
+                                        f_text = re.sub(match, new_pattern, f_text, flags=re.IGNORECASE)
+
+
+                            # CASE 1E: TRANSFORMS
+                            if STAGE_2 and file.endswith('transforms.conf'):
+
+                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+
+                                # Standard check for transforms.
+                                # Example: "FORMAT = new_index"
+                                pattern_format = r'FORMAT\s*=\s*{0}\b'.format(old_index)
+                                if re.search(pattern_format, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_format, f_text)))
+                                    check_dry(backup_file)(file)
+                                    new_pattern = "FORMAT = {0}".format(new_index)
+                                    f_text = re.sub(pattern_format, new_pattern, f_text, flags=re.IGNORECASE)
+
+
+                        # CASE 2: 1-MANY map.
+                        else:
+
+                            # CASE 2A: SEARCHES
+                            if STAGE_1 and \
+                               (file.endswith(('macros.conf', 'savedsearches.conf')) or \
+                               file.endswith('.xml') and 'views' in root or \
+                               file.endswith('.xml') and 'panels' in root or \
+                               file.endswith('.csv') and 'history' in root):
+
+                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+
+                                # Checks for case where IN operator is used.
+                                # Example: "index IN (main,os,netops,hadoop)"
+                                pattern_IN = r'index\s*IN.*?{0}\b'.format(old_index)
+                                if re.search(pattern_IN, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN, f_text)))
+                                    check_dry(backup_file)(file)
+                                    for match in re.finditer(pattern_IN, f_text, flags=re.IGNORECASE):
+                                        new_pattern = match.expand('\g<0>') + "," + ",".join(new_indexes)
+                                        f_text = re.sub(pattern_IN, new_pattern, f_text, flags=re.IGNORECASE)
+
+                                # Second possibility of IN operator being used.
+                                # Example: "IN(index,main,os,netops,hadoop)"
+                                pattern_IN_2 = r'IN\(index,.*{0}\b'.format(old_index)
+                                if re.search(pattern_IN_2, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_IN_2, f_text)))
+                                    check_dry(backup_file)(file)
+                                    for match in re.finditer(pattern_IN_2, f_text, flags=re.IGNORECASE):
+                                        new_pattern = match.expand('\g<0>') + "," + ','.join(new_indexes)
+                                        f_text = re.sub(pattern_IN_2, new_pattern, f_text, flags=re.IGNORECASE)
+
+                                # Checks for case where wildcard is used. This must be manually reviewed.
+                                pattern_wildcard = r'index\s*=\s*"*{0}\*'.format(old_index)
+                                if re.search(pattern_wildcard, f_text, re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND WILDCARD. REVIEW MANUALLY."))
+                                    MANUAL_CHANGES_DICT[file].append((old_index, "Wildcard found."))
+
+                                # Checks for all permutations of "index = <index>", including those in dashboards.
+                                pattern_index = re.compile(r"""
+                                                            index
+                                                            (?:\s|%20)*=(?:\s|%20)*    # separates key from value
+                                                            (?:
+                                                                  {index}\b
+                                                                | "{index}\b"
+                                                                | ""{index}\b""
+                                                                | %22{index}\b%22      # accounts for URL-encoded double quote
+                                                            )
+                                                            (?!\*)                     # ignore pattern if index has wildcard
+                                                            """.format(index=old_index), re.VERBOSE)
+                                # pattern_index = r'index(?:\s|%20)*=(?:\s|%20)*(?:{index}\b|"{index}\b"|""{index}\b""|%22{index}\b%22)(?!\*)'.format(index=old_index)
+                                if re.search(pattern_index, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_index, f_text)))
+                                    check_dry(backup_file)(file)
+                                    new_pattern = "(" \
+                                                 + "index={0}".format(old_index) \
+                                                 + " OR index=" \
+                                                 + " OR index=".join(new_indexes) \
+                                                 + ")"
+
+                                    f_text = re.sub(pattern_index, new_pattern, f_text, flags=re.IGNORECASE)
+
+                                # Fixes up the URL-encoded section of dashboards and replaces spaces with %20.
+                                # This replacement is necessary for URL-encoded sections.
+                                pattern_target = r'target=.*?index={}.*?</link>'.format(old_index)
+                                if re.search(pattern_target, f_text, flags=re.IGNORECASE):
+                                    logging.warning(log_format.format("FOUND MATCH FOR PATTERN {0} IN TEXT {1}".format(pattern_target, f_text)))
+                                    check_dry(backup_file)(file)
+                                    for match in re.finditer(pattern_target, f_text, flags=re.IGNORECASE):
+                                        # Replace spaces with %20, the HTML formatted value for a space.
+                                        new_pattern = match.expand('\g<0>').replace(' ', '%20')
+                                        f_text = re.sub(pattern_target, new_pattern, f_text, flags=re.IGNORECASE)
+
+                            # CASE 2B: INDEXES
+                            if STAGE_1 and file.endswith('indexes.conf'):
+                                pass
+
+                            # CASE 2C: WMI/METRICS
+                            if STAGE_1 and (file.endswith('wmi.conf') or \
+                               file.endswith('metric_alerts.conf') or \
+                               file.endswith('metric_rollups.conf')):
+                                # This is where we CHECK that the search found something before we log it.
+                                logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+                                logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR MISC."))
+                                MANUAL_CHANGES_DICT[file].append((old_index, "Miscellaneous file found."))
+                                pass
+
+                            # CASE 2D: INPUTS
+                            if STAGE_2 and file.endswith('inputs.conf'):
+
+                                pattern = r'index\s*=\s*{0}\b'.format(old_index)
+
+                                if re.search(pattern, f_text, flags=re.IGNORECASE):
+                                    logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+                                    logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR INPUTS."))
+                                    MANUAL_CHANGES_DICT[file].append((old_index, "1-MANY input found."))
+                                    pass
+
+                            # CASE 2E: TRANSFORMS
+                            if STAGE_2 and file.endswith('transforms.conf'):
+
+                                pattern = r'FORMAT\s*=\s*{0}\b'.format(old_index)
+                                if re.search(pattern, f_text, flags=re.IGNORECASE):
+                                    logging.info(log_format.format("FOUND FILE: {0}".format(file)))
+                                    logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR TRANSFORMS."))
+                                    MANUAL_CHANGES_DICT[file].append((old_index, "1-MANY transform found."))
+                                    pass
+
+
+
+                    # After all changes to f_text are made, append to file.
                     if not DRY_RUN:
-                        with open(file, 'w') as f:
-                            f.write(new_text)
-
-                elif 'macros' in file or \
-                     'savedsearches' in file or \
-                     'views' in file or \
-                     'panels' in file or \
-                     'history' in file:
-
-                    with open(file, 'r') as f:
-                        f_text = f.read()
-
-                    # Uses IN operator.
-                    if "index IN" in f_text:
-                        search_pattern = "((index\s*IN.*?){0})".format(old_index)
-                        pattern, index_prefix = re.findall(pattern, f_text)[0]
-                        new_pattern = index_prefix + new_index
-                        new_text = re.sub(pattern, new_pattern, f_text)
-
-                    else:
-                        pattern = "index\s*=\s*{0}".format(old_index)
-                        new_pattern = "index={0} OR index={1}".format(old_index, new_index)
-                        new_text = re.sub(pattern, new_pattern, f_text)
-
-                    if not DRY_RUN:
-                        with open(file, 'w') as f:
-                            f.write(new_text)
-
-            # TRANSFORMS
-            for file in files_2:
-
-                check_dry(backup_file)(file)
-
-                with open(file, 'r') as f:
-                    f_text = f.read()
-
-                pattern = "FORMAT\s*=\s*{0}".format(old_index)
-                new_pattern = "FORMAT = {0}".format(new_index)
-                new_text = re.sub(pattern, new_pattern, f_text)
-                
-                if not DRY_RUN:
-                    with open(file, 'w') as f:
-                        f.write(new_text)
-
-            # MISC
-            for file in files_3:
-
-                with open(file, 'r') as f:
-                    f_text = f.read()
-
-                pattern = "((indexes\s=\s.*?,?){0}(,?.*))(?:\s|\n)".format(old_index)
-                catch_all, catch_prefix, catch_suffix = re.findall(pattern, f_text)[0]
-                new_pattern = catch_prefix + new_index + catch_suffix
-                new_text = re.sub(catch_all, new_pattern, f_text)
-
-                if not DRY_RUN:
-                    with open(file, 'w') as f:
-                        f.write(new_text)
+                        with open(file, 'a') as f:
+                            f.write(f_text)
 
 
+    # After all manual changed have been identified, record in txt file.
+    if MANUAL_CHANGES_DICT:
+        with open(MANUAL_CHANGES_LOG, 'a') as f:
+            for file, data in MANUAL_CHANGES_DICT.items():
+                f.write("==========\nFILE: {0}\n==========\n".format(file))
+                for index, description in data:
+                    f.write("INDEX: {0}\n".format(index))
+                    f.write("DESCRIPTION: {0}\n\n".format(description))
 
-    # CASE 2. NOT 1-1 map. KO object subcase is easy to change but inputs/transforms are NOT.
-    # 2a. inputs and transforms: needs manual review. 
-    # 2b. macros and savedsearches: replace index=old_index with index=old_index OR index=new_index1 OR ...
+    # Signifies end of current stage. Useful for following stage.
+    # This is problematic because the backup file log is used to read in data...
+    # Could create a 'shelve' file for write/read and a 'log' file for append.
+    #if not DRY_RUN:
+    #    with open(BACKUP_FILE_LOG, 'a') as f:
+    #        stage_text = "END OF " + "STAGE 1\n"*STAGE_1 + "STAGE 2\n"*STAGE_2
+    #        f.write("===============\n")
+    #        f.write(stage_text)
+    #        f.write("===============")
+    #        if STAGE_1:
+    #            f.write("\n\n")
 
-    # What about wildcards? firewall --> firewall_palo_alto, firewall_fortigate, ...
-    # this SHOULD just resolve to firewall*, so it could be that easy...
-    # ...make sure by testing that all(firewall, firewall_palo_alto, ...) are satisfied by firewall*
-    # check whether the old_index is a subset of ALL of the new_indexes. if so, then replace old_index with old_index*.
-    # if not, then it's more complicated and needs a concat.
-    # CASE 1: old_index is substring of ALL new indexes. new_index.startswith(old_index) for all ..... old_index --> old_index*
-    # CASE 2: NOT substring.
-
-
-    for old_index in d_map_not_11:
-            
-        new_indexes = d_map_not_11[old_index]
-
-        logging.debug(log_format.format("CASE 2 for {0} index: Now identifying files that may or may not be changed with the multi-map.".format(old_index)))
-
-        # At this point, we've selected the dirs that are appropriate for the instance. We're safe here.
-        for dir in dirs:
-
-            logging.debug(log_format.format("Checking {} directory.".format(dir)))
-
-            # Search 1. Check for inputs, macros, dashboards, and history in this directory.
-
-            stream = os.popen(grep_inputs_searches.format(dir, old_index))
-            cmd_output = stream.read().split('\n')
-            files_1 = filternull(cmd_output)
-
-            # Search 2. Check for transforms in this directory.
-
-            stream = os.popen(grep_transforms.format(dir, old_index))
-            cmd_output = stream.read().split('\n')
-            files_2 = filternull(cmd_output)
-
-            # Search 3. Check for miscellaneous possibilities.
-
-            stream = os.popen(grep_misc.format(dir, old_index))
-            cmd_output = stream.read().split('\n')
-            files_3 = filternull(cmd_output)
-
-            if files_1:
-                logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_1)))
-            if files_2:
-                logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_2)))
-            if files_3:
-                logging.debug(log_format.format("Identified files that need to be changed: {}".format(files_3)))
-            if not any((files_1, files_2, files_3)):
-                logging.debug(log_format.format("No files identified."))
-
-            # Now we have a list of files containing references to the old index.
-            # We can loop over them separately because they have different rules depending on inputs, transforms, etc.
-
-            # INPUTS AND SEARCHES
-            for file in files_1:
-                # IGNORE INPUTS. Only history/macros/savedsearches are relevant.
-
-                if 'inputs' in file:
-                    logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR INPUTS."))
-                    pass
-
-                elif 'macros' in file or \
-                     'savedsearches' in file or \
-                     'views' in file or \
-                     'panels' in file or \
-                     'history' in file:
-
-                    check_dry(backup_file)(file)
-
-                    with open(file, 'r') as f:
-                        f_text = f.read()
-
-                    # Uses IN operator.
-                    if "index IN" in f_text:
-                        pattern = "(index\s*IN.*?){0}".format(old_index)
-                        old_pattern = pattern + old_index
-                        index_prefix = re.findall(pattern, f_text)[0]
-                        new_pattern = index_prefix \
-                                    + old_index \
-                                    + "," \
-                                    + ",".join(new_indexes)
-                        new_text = re.sub(old_pattern, new_pattern, f_text)
-
-                    else:
-                        pattern = "index\s*=\s*{0}".format(old_index)
-                        new_pattern = "index={0}".format(old_index) \
-                                    + " OR index=" \
-                                    + " OR index=".join(new_indexes)
-                        new_text = re.sub(pattern, new_pattern, f_text)
-
-                    if not DRY_RUN:
-                        with open(file, 'w') as f:
-                            f.write(new_text)
-
-            # TRANSFORMS
-            for file in files_2:
-                logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR TRANSFORMS."))
-                pass
-
-            # MISC
-            for file in files_3:
-                logging.debug(log_format.format("PERFORM MANUAL REVIEW FOR MISC."))
-                pass
 
 ###################
 # UTILITY FUNCTIONS
 ###################
 
+
 @log
 @debug
 def get_index_map(map_file):
+    """
+    Takes CSV file and converts it to a dictionary for use in main function.
+    """
 
     f_name = get_function_name()
+    log_format = "{0}: {1}".format(f_name)
     log_format = f_name + ": " + "{0}"
 
     logging.debug(log_format.format("Mapping old index to new indexes."))
 
     # Create dictionary that maps old index to new indexes.
-    d_i = dict()
+    d_indexes = dict()
     with open(map_file, 'r') as f:
         reader = csv.reader(f, delimiter=',')
         for row in reader:
             if row:
                 # This unpacks the remaining new indexes in that row into a list.
-                # new_indexes is ALWAYS a list.
+                # new_indexes is always a list.
                 old_index, new_indexes = row[0], row[1:]
-                d_i[old_index] = new_indexes
+                d_indexes[old_index] = new_indexes
 
     logging.debug(log_format.format("Mapping complete. Returning dictionary."))
 
-    return d_i
+    return d_indexes
 
 
 @log
 @debug
-def revert_changes():
+def get_dirs(instance):
+    """
+    Each instance has a set of directories that should be checked.
+    Some directories won't be checked if the DS already deploys to those directories.
+    """
 
-    f_name = get_function_name()
-    log_format = f_name + ": " + "{0}"
+    # check on all.
+    dir_system = os.path.join(TARGET_DIRECTORY, 'etc/system')
+    dir_disabled_apps = os.path.join(TARGET_DIRECTORY, 'etc/disabled-apps')
+    dir_users = os.path.join(TARGET_DIRECTORY, 'etc/users')
 
-    # Open file located in same directory that script was run in. Read it.
-    backup_files = os.path.join(INITIAL_WORKING_DIRECTORY, 'backup_file_log.txt')
+    # check on DS.
+    dir_deployment_apps = os.path.join(TARGET_DIRECTORY, 'etc/deployment-apps')
 
-    with open(backup_files, 'r') as f:
-        files_text = f.read()
-        files_text_list = files_text.split('\n')
-        files = filternull(files_text_list)
+    # Check on CM unless managed.
+    dir_master_apps = os.path.join(TARGET_DIRECTORY, 'etc/master-apps')
 
-    issues_found = False
+    # Check on Deployer unless managed.
+    dir_shcluster_apps = os.path.join(TARGET_DIRECTORY, 'etc/shcluster/apps')
 
-    for file in files:
+    # Check on DS.
+    # Check on CM only if repositoryLocation = /master-apps.
+    # Check on Deployer only if repositoryLocation = /shcluster/apps.
+    # Check on SH/IDX/HF if not managed.
+    dir_apps = os.path.join(TARGET_DIRECTORY, 'etc/apps')
 
-        # Check directory contents before change.
-        cwd = os.path.dirname(file)
-        stream = os.popen("ls {}".format(cwd))
-        ls1 = stream.read()
+    dirs = list()
+    dirs_all = [dir_system, dir_disabled_apps, dir_users]
 
-        # Make reversion.
-        backup_file = file + ".bak.script"
-        shutil.move(backup_file, file)
-        # stream = os.popen("mv {0} {1}".format(backup_file, file))
+    if instance == 'DS':
+        dirs = dirs_all + [dir_deployment_apps, dir_apps]
+    if instance == 'CM':
+        if not MANAGED_DIRECTORY:
+            dirs = dirs_all + [dir_apps, dir_master_apps]
+        elif MANAGED_DIRECTORY == 'etc/apps':
+            dirs = dirs_all + [dir_master_apps]
+        elif MANAGED_DIRECTORY == 'etc/master-apps':
+            dirs = dirs_all + [dir_apps]
+    if instance in ['SH', 'IDX', 'HF']:
+        if not MANAGED_DIRECTORY:
+            dirs = dirs_all + [dir_apps]
+        elif MANAGED_DIRECTORY == 'etc/apps':
+            dirs = dirs_all
+    if instance == 'DEPLOYER':
+        if not MANAGED_DIRECTORY:
+            dirs = dirs_all + [dir_apps, dir_shcluster_apps]
+        elif MANAGED_DIRECTORY == 'etc/apps':
+            dirs = dirs_all + [dir_shcluster_apps]
+        elif MANAGED_DIRECTORY == 'etc/shcluster/apps':
+            dirs = dirs_all + [dir_apps]
+    if instance == 'OTHER':
+        if not MANAGED_DIRECTORY:
+            dirs = dirs_all + [dir_apps]
+        elif MANAGED_DIRECTORY == 'etc/apps':
+            dirs = dirs_all
 
-        time.sleep(1)
-
-        # Check directory contents after change.
-        cwd = os.path.dirname(file)
-        stream = os.popen("ls {}".format(cwd))
-        ls2 = stream.read()
-
-        logging.debug(log_format.format("ls1 = {0}".format(ls1)))
-        logging.debug(log_format.format("ls2 = {0}".format(ls2)))
-
-        # Check whether backup of file was successful.
-        if ls1 == ls2:
-            logging.debug(log_format.format("Something went wrong! No reversion."))
-            issues_found = True
-        else:
-            logging.debug(log_format.format("Reversion successful."))
-
-    if not issues_found:
-        logging.debug(log_format.format("Now removing file: {0}".format(backup_files)))
-        command = "rm {0}".format(backup_files)
-        stream = os.popen(command)
-    else:
-        find_command = "find {0} -type f -name '*bak.script'".format(TARGET_DIRECTORY)
-        stream = os.popen(find_command)
-        cmd_output = stream.read().split('\n')
-        bak_files = filternull(cmd_output)
-        logging.debug("Failed to revert changes. The following backup files were found: {0}".format(bak_files))
-
-
-def filternull(L):
-    return list(filter(None, L))
+    return dirs
 
 
 @log
 @debug
 def backup_file(file):
+    """
+    Creates copy of file before changes are made to it.
+    The bak.script file can be removed or re-instated with the revert_changes() or accept_changes() functions.
+    """
+
+    f_name = get_function_name()
+    log_format = get_function_name() + ": " + "{0}"
+
+    # Confirms that DRY_RUN = False and confirms that the file has not already been backed up.
+    backup_file = file + ".bak.script"
+
+    if os.path.isfile(backup_file):
+        logging.debug(log_format.format("File already exists. Not backing up."))
+        return
+
+    if not DRY_RUN:
+
+        # Record file in backup_file_log.txt file. This is used for reversion.
+        with open(BACKUP_FILE_LOG, 'a') as f:
+            f.write('{}\n'.format(file))
+
+        # Make backup.
+        try:
+            shutil.copy(file, backup_file)
+        except FileNotFoundError:
+            logging.warning(log_format.format("Backup failed. File does not exist."))
+            return
+        else:
+            logging.debug(log_format.format("Backup successful."))
+
+
+@log
+@debug
+def revert_changes():
+    """
+    Copies bak.script files over changed files. Reverts to original state.
+    """
 
     f_name = get_function_name()
     log_format = f_name + ": " + "{0}"
 
-    # Confirms that DRY_RUN = False.
-    # Confirms that file has not already been backed up.
-    backup_file = file + ".bak.script"
-    if not DRY_RUN and not os.path.isfile(backup_file):
 
-        # Script assumes the parent of the splunk folder is the directory that the script lives in.
-        backup_record = os.path.join(INITIAL_WORKING_DIRECTORY, "backup_file_log.txt")
+    # Exit if backup_file_log.txt doesn't exist.
+    try:
+        with open(BACKUP_FILE_LOG, 'r') as f:
+            files_text = f.read()
+            files_text_list = files_text.split('\n')
+            files = list(filter(None, files_text_list))
+    except FileNotFoundError:
+        logging.debug(log_format.format("backup_file_log.txt does not exist."))
+        return
 
-        # Record file in backup_file_log.txt file. This can be used for reversion.
-        with open(backup_record, 'a') as f:
-            f.write('\n{}'.format(file))
+    issues_found = False
 
-        # Check directory contents before change.
-        cwd = os.path.dirname(file)
-        ls1 = os.listdir(cwd)
-        #stream = os.popen("ls {}".format(cwd))
-        #ls1 = stream.read()
-
-        # Make backup. Note that THIS is where the backup function doesn't get executed if DRY_RUN = True.
-        shutil.copy(file, backup_file)
-        # stream = check_dry(os.popen)("cp {}".format(file) + "{,.bak.script}")
-                   
-        # Check directory contents after change.
-        cwd = os.path.dirname(file)
-        ls2 = os.listdir(cwd)
-        # stream = os.popen("ls {}".format(cwd))
-        # ls2 = stream.read()
-
-        # Check whether backup of file was successful.
-        if ls1 == ls2:
-            logging.debug(log_format.format("Something went wrong! No backup."))
+    for file in files:
+        
+        # Make reversion.
+        try:
+            backup_file = file + ".bak.script"
+            shutil.move(backup_file, file)
+        except FileNotFoundError:
+            logging.debug(log_format.format("Reversion failed. Backup file not found."))
+            issues_found = True
         else:
-            logging.debug(log_format.format("Backup successful."))
-    
+            logging.debug(log_format.format("Reversion successful."))
+
+    # If no issues were found, removes backup_file_log.txt.
+    # Else, identifies remaining bak.script files.
+    if not issues_found:
+        logging.debug(log_format.format("Now removing file: {0}".format(BACKUP_FILE_LOG)))
+        if os.path.isfile(BACKUP_FILE_LOG):
+            os.remove(BACKUP_FILE_LOG)
+        if os.path.isfile(MANUAL_CHANGES_LOG):
+            os.remove(MANUAL_CHANGES_LOG)
+    else:
+        find_command = "find {0} -type f -name '*bak.script'".format(TARGET_DIRECTORY)
+        stream = os.popen(find_command)
+        cmd_output = stream.read().split('\n')
+        bak_files = list(filter(None, cmd_output))
+
+        logging.error("Failed to revert changes. The following backup files were found: {0}".format(bak_files))
+
+
+def accept_changes():
+    """
+    Removes all bak.script files.
+    """
+
+    f_name = get_function_name()
+    log_format = f_name + ": " + "{0}"
+
+    issues_found = False
+
+    # Reads in files that were changed.
+    try:
+        with open(BACKUP_FILE_LOG, 'r') as f:
+            files_text = f.read()
+            files_text_list = files_text.split('\n')
+            files = list(filter(None, files_text_list))
+    except FileNotFoundError:
+        logging.debug(log_format.format("backup_file_log.txt does not exist. Cancelling execution..."))
+        return
+
+    # Removes original file since changes have been accepted.
+    for file in files:
+
+        try:
+            backup_file = file + ".bak.script"
+            os.remove(backup_file)
+        except FileNotFoundError:
+            logging.debug(log_format.format("File deletion failed for {0}.".format(file)))
+            issues_found = True
+        else:
+            logging.debug(log_format.format("File deletion successful."))
+
+    # Remove file if no issues were found.
+    if not issues_found:
+        logging.debug(log_format.format("Now removing backup file: {0}".format(BACKUP_FILE_LOG)))
+        os.remove(BACKUP_FILE_LOG)
+    else:
+        logging.error("Failed to delete all backup files. Review logs.")
+
 
 ################
 # CLI INVOCATION
 ################
 
 if __name__ == '__main__':
-    """
-    --instance ALL/DS/CM/IDX
-    --disable-dry-run
-    --revert-changes
-    """
+
+    # Create parser and arguments.
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('-t', '-target', action='store', dest='target', required=True, help='Directory to execute script on.')
+    parser.add_argument('-m', '-map', action='store', dest='map', required=True, help='The full name of the CSV file that maps the old index to new indexes.')
+    parser.add_argument('-i', '-instance', action='store', dest='instance', required=True, choices=['DS', 'CM', 'SH', 'IDX', 'HF', 'DEPLOYER', 'OTHER'], help='The instance the script is running on. Used to select the directories that will be searched.')
+    parser.add_argument('--managed-directory', action='store', dest='managed_directory', required=False, choices=['etc/apps', 'etc/master-apps', 'etc/shcluster/apps'], help='If managed, indicate the directory that the DC loads their configurations.')
+
+    mutex_group = parser.add_mutually_exclusive_group(required=True)
+    mutex_group.add_argument('--stage-1', action='store_true', help='Runs script on macros/searches/dashboards/history, etc.')
+    mutex_group.add_argument('--stage-2', action='store_true', help='Runs script on inputs/transforms.')
+
+    mutex_group_2 = parser.add_mutually_exclusive_group(required=False)
+    mutex_group_2.add_argument('--disable-dry-run', action='store_false', dest='dry_run_state', help='Disables the safety feature that prevents the script from making production changes.')
+    mutex_group_2.add_argument('--revert-changes', action='store_true', help='Used to remove the backup files if the changes have been accepted.')
+    mutex_group_2.add_argument('--accept-changes', action='store_true', help='Used to delete backup files if changes have been accepted.')
+
+
+    # Access arguments.
+    args = parser.parse_args()
 
     global TARGET_DIRECTORY
     global INSTANCE
     global DRY_RUN
-    global INITIAL_WORKING_DIRECTORY
+    global INDEX_MAP
+    global STAGE_1
+    global STAGE_2
+    global MANAGED_DIRECTORY
 
-    INITIAL_WORKING_DIRECTORY = os.getcwd()
-
-    # Create parser for script arguments.
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument('-t', '-target', action='store', dest='target', required=True, help='Directory to execute script on.')
-    parser.add_argument('-i', '-instance', action='store', dest='instance', choices=['DS', 'CM', 'IDX', 'SH', 'OTHER'], required=True, help='The instance the script is running on. Used to select the directories that will be searched.')
-    parser.add_argument('-m', '-map', action='store', required=True, dest='map', help='The full name of the CSV file that maps the old index to new indexes.')
-
-    mutex_group = parser.add_mutually_exclusive_group(required=False)
-    mutex_group.add_argument('--disable-dry-run', action='store_false', dest='dry_run_state', help='Disables the safety feature that prevents the script from making production changes.')
-    mutex_group.add_argument('--revert-changes', action='store_true', help='Used to remove the backup files if the changes have been accepted.')
-
-    args = parser.parse_args()
-
-    # Access arguments.
     TARGET_DIRECTORY = args.target
     INSTANCE = args.instance
     DRY_RUN = args.dry_run_state
+    INDEX_MAP = args.map
+    STAGE_1 = args.stage_1
+    STAGE_2 = args.stage_2
+    MANAGED_DIRECTORY = args.managed_directory
 
-    # Don't actually use this for clients.
-    # if not DRY_RUN:
-    #     splunk_home = os.environ['SPLUNK_HOME']
-    #    assert TARGET_DIRECTORY == splunk_home, "For production, the target directory should be $SPLUNK_HOME."
 
-    # if not ENABLE_PROD:
-    #     splunk_home = os.environ['SPLUNK_HOME']
-    #     assert TARGET_DIRECTORY != splunk_home, "Since this is not enabled for production, not allowed to run script on $SPLUNK_HOME."
+    # Pre-flight checks.
+    splunk_home = os.environ.get('SPLUNK_HOME', '/opt/splunk')
 
-    if not args.map.endswith('csv'):
-        raise ValueError('The -map parameter should be a CSV file.')
+    if not DRY_RUN and TARGET_DIRECTORY == splunk_home:
+            input = raw_input("Are you sure you'd like to run the script in production? (Y/N) ")
+            input = input.strip().upper()
+            if input != 'Y':
+                sys.exit("Exited script by user request.")
+            else:
+                pass
 
+    if not INDEX_MAP.endswith('csv'):
+        sys.exit("The file given by the -map parameter should be a CSV file.")
+
+    if os.path.getsize(INDEX_MAP) == 0:
+        sys.exit("The file given by the -map parameter is empty.")
+
+    if not os.path.isdir(TARGET_DIRECTORY):
+        sys.exit("The directory given by the -target parameter is empty.")
+
+    # Execute functions.
     if args.revert_changes:
         revert_changes()
+    elif args.accept_changes:
+        accept_changes()
     else:
-        d_map = get_index_map(args.map)
-        update_references(d_map)
+        update_references()
