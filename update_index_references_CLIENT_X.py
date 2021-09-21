@@ -246,7 +246,7 @@ def update_configuration_files():
     for dir in instance_dirs:
         for root, _, files in os.walk(dir):
             # Exclude lookups and anything in a default directory.
-            # TIAA: REMOVING 'default' in root to solve custom TA issue. Put back in for future executions.
+            # CLIENT_X: REMOVING 'default' in root to solve custom TA issue. Put back in for future executions.
             if not 'lookups' in root:
                 for file in files:
 
@@ -1475,7 +1475,7 @@ if __name__ == '__main__':
 
     # Pre-flight checks.
     # splunk_home = os.environ.get('SPLUNK_HOME', '/opt/splunk')
-    splunk_home = os.environ.get('SPLUNK_HOME', '/opt/splunk/sh') # TIAA-specific
+    splunk_home = os.environ.get('SPLUNK_HOME', '/opt/splunk/sh') # CLIENT_X-specific
 
     if not DRY_RUN and TARGET_DIRECTORY == splunk_home:
             answer = input("Are you sure you'd like to run the script in production? (Y/N) ")
